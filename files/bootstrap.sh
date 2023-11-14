@@ -557,9 +557,6 @@ if [[ "$CONTAINER_RUNTIME" = "containerd" ]]; then
   sudo mkdir -p /etc/containerd
   sudo mkdir -p /etc/cni/net.d
 
-  sudo mkdir -p /etc/systemd/system/containerd.service.d
-  printf '[Service]\nSlice=runtime.slice\n' | sudo tee /etc/systemd/system/containerd.service.d/00-runtime-slice.conf
-
   if [[ -n "${CONTAINERD_CONFIG_FILE}" ]]; then
     sudo cp -v "${CONTAINERD_CONFIG_FILE}" /etc/eks/containerd/containerd-config.toml
   fi
@@ -658,6 +655,8 @@ if command -v nvidia-smi &> /dev/null; then
       nvidia-smi -ac 5001,1590
     elif [[ $GPUNAME == *"M60"* ]]; then
       nvidia-smi -ac 2505,1177
+    elif [[ $GPUNAME == *"H100"* ]]; then
+      nvidia-smi -ac 2619,1980
     else
       echo "unsupported gpu"
     fi

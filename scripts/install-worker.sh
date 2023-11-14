@@ -52,6 +52,13 @@ fi
 ### Packages ###################################################################
 ################################################################################
 
+sudo yum install -y \
+  yum-utils \
+  yum-plugin-versionlock
+
+# lock the version of the kernel and associated packages before we yum update
+sudo yum versionlock kernel-$(uname -r) kernel-headers-$(uname -r) kernel-devel-$(uname -r)
+
 # Update the OS to begin with to catch up to the latest packages.
 sudo yum update -y
 
@@ -68,8 +75,6 @@ sudo yum install -y \
   socat \
   unzip \
   wget \
-  yum-utils \
-  yum-plugin-versionlock \
   mdadm \
   pigz
 
@@ -87,8 +92,6 @@ else
   # curl-minimal already exists in al2023 so install curl only on al2
   sudo yum install -y curl
 fi
-
-sudo yum versionlock kernel-$(uname -r) kernel-headers-$(uname -r) kernel-devel-$(uname -r)
 
 # Remove the ec2-net-utils package, if it's installed. This package interferes with the route setup on the instance.
 if yum list installed | grep ec2-net-utils; then sudo yum remove ec2-net-utils -y -q; fi
@@ -171,8 +174,15 @@ sudo mv $WORKING_DIR/pull-sandbox-image.sh /etc/eks/containerd/pull-sandbox-imag
 sudo mv $WORKING_DIR/pull-image.sh /etc/eks/containerd/pull-image.sh
 sudo chmod +x /etc/eks/containerd/pull-sandbox-image.sh
 sudo chmod +x /etc/eks/containerd/pull-image.sh
-
 sudo mkdir -p /etc/systemd/system/containerd.service.d
+CONFIGURE_CONTAINERD_SLICE=$(vercmp "$KUBERNETES_VERSION" gteq "1.24.0" || true)
+if [ "$CONFIGURE_CONTAINERD_SLICE" == "true" ]; then
+  cat << EOF | sudo tee /etc/systemd/system/containerd.service.d/00-runtime-slice.conf
+[Service]
+Slice=runtime.slice
+EOF
+fi
+
 cat << EOF | sudo tee /etc/systemd/system/containerd.service.d/10-compat-symlink.conf
 [Service]
 ExecStartPre=/bin/ln -sf /run/containerd/containerd.sock /run/dockershim.sock
@@ -187,6 +197,16 @@ cat << EOF | sudo tee -a /etc/sysctl.d/99-kubernetes-cri.conf
 net.bridge.bridge-nf-call-ip6tables = 1
 net.bridge.bridge-nf-call-iptables = 1
 net.ipv4.ip_forward = 1
+EOF
+
+###############################################################################
+### Nerdctl setup #############################################################
+###############################################################################
+
+sudo yum install -y nerdctl
+sudo mkdir /etc/nerdctl
+cat << EOF | sudo tee -a /etc/nerdctl/nerdctl.toml
+namespace = "k8s.io"
 EOF
 
 ################################################################################
@@ -435,6 +455,7 @@ if [[ "$CACHE_CONTAINER_IMAGES" == "true" ]] && ! [[ ${ISOLATED_REGIONS} =~ $BIN
     ${VPC_CNI_IMGS[@]+"${VPC_CNI_IMGS[@]}"}
   )
   PULLED_IMGS=()
+  REGIONS=$(aws ec2 describe-regions --all-regions --output text --query 'Regions[].[RegionName]')
 
   for img in "${CACHE_IMGS[@]}"; do
     ## only kube-proxy-minimal is vended for K8s 1.24+
@@ -459,12 +480,13 @@ if [[ "$CACHE_CONTAINER_IMAGES" == "true" ]] && ! [[ ${ISOLATED_REGIONS} =~ $BIN
   done
 
   #### Tag the pulled down image for all other regions in the partition
-  for region in $(aws ec2 describe-regions --all-regions | jq -r '.Regions[] .RegionName'); do
+  for region in ${REGIONS[*]}; do
     for img in "${PULLED_IMGS[@]}"; do
-      regional_img="${img/$BINARY_BUCKET_REGION/$region}"
+      region_uri=$(/etc/eks/get-ecr-uri.sh "${region}" "${AWS_DOMAIN}")
+      regional_img="${img/$ECR_URI/$region_uri}"
       sudo ctr -n k8s.io image tag "${img}" "${regional_img}" || :
       ## Tag ECR fips endpoint for supported regions
-      if [[ "${region}" =~ (us-east-1|us-east-2|us-west-1|us-west-2|us-gov-east-1|us-gov-east-2) ]]; then
+      if [[ "${region}" =~ (us-east-1|us-east-2|us-west-1|us-west-2|us-gov-east-1|us-gov-west-1) ]]; then
         regional_fips_img="${regional_img/.ecr./.ecr-fips.}"
         sudo ctr -n k8s.io image tag "${img}" "${regional_fips_img}" || :
         sudo ctr -n k8s.io image tag "${img}" "${regional_fips_img/-eksbuild.1/}" || :
@@ -481,11 +503,15 @@ fi
 ### SSM Agent ##################################################################
 ################################################################################
 
-echo "Installing amazon-ssm-agent"
-if ! [[ ${ISOLATED_REGIONS} =~ $BINARY_BUCKET_REGION ]]; then
-  sudo yum install -y https://s3.${BINARY_BUCKET_REGION}.${S3_DOMAIN}/amazon-ssm-${BINARY_BUCKET_REGION}/${SSM_AGENT_VERSION}/linux_${ARCH}/amazon-ssm-agent.rpm
+if yum list installed | grep amazon-ssm-agent; then
+  echo "amazon-ssm-agent already present - skipping install"
 else
-  sudo yum install -y amazon-ssm-agent
+  echo "Installing amazon-ssm-agent"
+  if ! [[ ${ISOLATED_REGIONS} =~ $BINARY_BUCKET_REGION ]]; then
+    sudo yum install -y https://s3.${BINARY_BUCKET_REGION}.${S3_DOMAIN}/amazon-ssm-${BINARY_BUCKET_REGION}/${SSM_AGENT_VERSION}/linux_${ARCH}/amazon-ssm-agent.rpm
+  else
+    sudo yum install -y amazon-ssm-agent
+  fi
 fi
 
 ################################################################################
@@ -522,6 +548,7 @@ echo vm.max_map_count=524288 | sudo tee -a /etc/sysctl.conf
 echo net.netfilter.nf_conntrack_tcp_timeout_time_wait=65 | sudo tee -a /etc/sysctl.conf
 echo net.core.somaxconn=65535 | sudo tee -a /etc/sysctl.conf
 echo "@reboot /bin/bash -l -c '/sbin/modprobe nf_conntrack; /usr/sbin/sysctl -p'" | sudo crontab -
+echo 'kernel.pid_max=4194304' | sudo tee -a /etc/sysctl.conf
 
 ################################################################################
 ### adding log-collector-script ################################################
