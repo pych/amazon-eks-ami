@@ -61,5 +61,7 @@
     "net.ipv4.tcp_wmem"
   ],
   "imageGCHighThresholdPercent": 70,
-  "imageGCLowThresholdPercent": 50
+  "imageGCLowThresholdPercent": 50,
+  "shutdownGracePeriodCriticalPods": "360s",
+  "shutdownGracePeriod": "420s"
 }
