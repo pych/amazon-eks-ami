@@ -32,7 +32,6 @@ validate_env_set PULL_CNI_FROM_GITHUB
 validate_env_set PAUSE_CONTAINER_VERSION
 validate_env_set CACHE_CONTAINER_IMAGES
 validate_env_set WORKING_DIR
-validate_env_set SSM_AGENT_VERSION
 
 ################################################################################
 ### Machine Architecture #######################################################
@@ -87,14 +86,29 @@ fi
 # packages that need special handling
 if cat /etc/*release | grep "al2023" > /dev/null 2>&1; then
   # exists in al2023 only (needed by kubelet)
-  sudo yum install -y iptables-legacy
+  sudo yum install -y iptables-nft
+
+  # Mask udev triggers installed by amazon-ec2-net-utils package
+  sudo touch /etc/udev/rules.d/99-vpc-policy-routes.rules
+
+  # Make networkd ignore foreign settings, else it may unexpectedly delete IP rules and routes added by CNI
+  sudo mkdir -p /usr/lib/systemd/networkd.conf.d/
+  cat << EOF | sudo tee /usr/lib/systemd/networkd.conf.d/80-release.conf
+# Do not clobber any routes or rules added by CNI.
+[Network]
+ManageForeignRoutes=no
+ManageForeignRoutingPolicyRules=no
+EOF
+
+  # Temporary fix for https://github.com/aws/amazon-vpc-cni-k8s/pull/2118
+  sudo sed -i "s/^MACAddressPolicy=.*/MACAddressPolicy=none/" /usr/lib/systemd/network/99-default.link || true
 else
   # curl-minimal already exists in al2023 so install curl only on al2
   sudo yum install -y curl
-fi
 
-# Remove the ec2-net-utils package, if it's installed. This package interferes with the route setup on the instance.
-if yum list installed | grep ec2-net-utils; then sudo yum remove ec2-net-utils -y -q; fi
+  # Remove the ec2-net-utils package, if it's installed. This package interferes with the route setup on the instance.
+  if yum list installed | grep ec2-net-utils; then sudo yum remove ec2-net-utils -y -q; fi
+fi
 
 sudo mkdir -p /etc/eks/
 
@@ -159,6 +173,9 @@ sudo yum versionlock runc-*
 # install containerd and lock version
 sudo yum install -y containerd-${CONTAINERD_VERSION}
 sudo yum versionlock containerd-*
+
+# install cri-tools for crictl, needed to interact with containerd's CRI server
+sudo yum install -y cri-tools
 
 sudo mkdir -p /etc/eks/containerd
 if [ -f "/etc/eks/containerd/containerd-config.toml" ]; then
@@ -395,14 +412,9 @@ if [[ "$CACHE_CONTAINER_IMAGES" == "true" ]] && ! [[ ${ISOLATED_REGIONS} =~ $BIN
   AWS_DOMAIN=$(imds 'latest/meta-data/services/domain')
   ECR_URI=$(/etc/eks/get-ecr-uri.sh "${BINARY_BUCKET_REGION}" "${AWS_DOMAIN}")
 
-  PAUSE_CONTAINER="${ECR_URI}/eks/pause:${PAUSE_CONTAINER_VERSION}"
-  cat /etc/eks/containerd/containerd-config.toml | sed s,SANDBOX_IMAGE,$PAUSE_CONTAINER,g | sudo tee /etc/eks/containerd/containerd-cached-pause-config.toml
-  sudo cp -v /etc/eks/containerd/containerd-cached-pause-config.toml /etc/containerd/config.toml
-  sudo cp -v /etc/eks/containerd/sandbox-image.service /etc/systemd/system/sandbox-image.service
-  sudo chown root:root /etc/systemd/system/sandbox-image.service
   sudo systemctl daemon-reload
   sudo systemctl start containerd
-  sudo systemctl enable containerd sandbox-image
+  sudo systemctl enable containerd
 
   K8S_MINOR_VERSION=$(echo "${KUBERNETES_VERSION}" | cut -d'.' -f1-2)
 
@@ -450,7 +462,6 @@ if [[ "$CACHE_CONTAINER_IMAGES" == "true" ]] && ! [[ ${ISOLATED_REGIONS} =~ $BIN
   fi
 
   CACHE_IMGS=(
-    "${PAUSE_CONTAINER}"
     ${KUBE_PROXY_IMGS[@]+"${KUBE_PROXY_IMGS[@]}"}
     ${VPC_CNI_IMGS[@]+"${VPC_CNI_IMGS[@]}"}
   )
@@ -506,10 +517,11 @@ fi
 if yum list installed | grep amazon-ssm-agent; then
   echo "amazon-ssm-agent already present - skipping install"
 else
-  echo "Installing amazon-ssm-agent"
-  if ! [[ ${ISOLATED_REGIONS} =~ $BINARY_BUCKET_REGION ]]; then
+  if ! [[ -z "${SSM_AGENT_VERSION}" ]]; then
+    echo "Installing amazon-ssm-agent@${SSM_AGENT_VERSION} from S3"
     sudo yum install -y https://s3.${BINARY_BUCKET_REGION}.${S3_DOMAIN}/amazon-ssm-${BINARY_BUCKET_REGION}/${SSM_AGENT_VERSION}/linux_${ARCH}/amazon-ssm-agent.rpm
   else
+    echo "Installing amazon-ssm-agent from AL core repository"
     sudo yum install -y amazon-ssm-agent
   fi
 fi
