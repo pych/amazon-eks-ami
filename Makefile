@@ -27,7 +27,7 @@ ifeq ($(call vercmp,$(kubernetes_version),gteq,1.25.0), true)
 endif
 
 AMI_VERSION ?= v$(shell date '+%Y%m%d')
-AMI_VARIANT ?= amazon-eks
+AMI_VARIANT ?= fw-eks
 ifneq (,$(findstring al2023, $(PACKER_TEMPLATE_FILE)))
 	AMI_VARIANT := $(AMI_VARIANT)-al2023
 endif
